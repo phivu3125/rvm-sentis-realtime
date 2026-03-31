@@ -1,0 +1,182 @@
+// RVM Composite Compute Shader
+// Optimized GPU-based compositing for Robust Video Matting
+// Features: Alpha blending, Morphology (Erode/Dilate), Background replacement
+
+#pragma kernel Composite
+#pragma kernel Erode
+#pragma kernel Dilate
+
+// ============== COMPOSITE KERNEL ==============
+RWTexture2D<float4> _Result;
+Texture2D<float4> _SourceTex;
+Texture2D<float4> _MaskTex;
+Texture2D<float4> _BackgroundTex;
+SamplerState sampler_linear_clamp;
+
+int2 _SourceSize;
+int2 _MaskSize;
+float _AlphaThreshold;
+float _Feather;
+float _EdgeStrength;
+float4 _BackgroundColor;
+int _UseBackgroundTex;
+
+// ============== EDGE REFINEMENT HELPERS ==============
+// Simple edge detection using mask gradient (UV-based for resolution independence)
+float getMaskEdgeFactor(float2 uv)
+{
+    float2 texelSize = 1.0 / float2(_MaskSize);
+    
+    float l = _MaskTex.SampleLevel(sampler_linear_clamp, uv + float2(-texelSize.x, 0), 0).r;
+    float r = _MaskTex.SampleLevel(sampler_linear_clamp, uv + float2(texelSize.x, 0), 0).r;
+    float t = _MaskTex.SampleLevel(sampler_linear_clamp, uv + float2(0, -texelSize.y), 0).r;
+    float b = _MaskTex.SampleLevel(sampler_linear_clamp, uv + float2(0, texelSize.y), 0).r;
+    
+    // Edge = high gradient
+    float gradient = abs(r - l) + abs(b - t);
+    return saturate(gradient * 2.0);
+}
+
+// Refine mask at edges - push towards 0 or 1 for cleaner boundaries
+float refineMaskEdge(float mask, float edgeFactor, float strength)
+{
+    if (edgeFactor < 0.01 || strength < 0.01) return mask;
+    
+    // At edges, push mask towards 0 or 1
+    float refined = mask;
+    if (mask > 0.5)
+    {
+        // Push towards 1
+        refined = mask + (1.0 - mask) * edgeFactor * strength;
+    }
+    else
+    {
+        // Push towards 0
+        refined = mask * (1.0 - edgeFactor * strength);
+    }
+    
+    return saturate(refined);
+}
+
+[numthreads(8,8,1)]
+void Composite(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_SourceSize.x || id.y >= (uint)_SourceSize.y) return;
+    
+    int2 pix = int2(id.x, id.y);
+    float4 src = _SourceTex.Load(int3(pix, 0));
+    
+    // Calculate UV for mask sampling
+    float2 uv = (float2(pix) + 0.5) / float2(_SourceSize);
+    
+    // Sample mask (bilinear interpolation) - Y flip already done in C#
+    // MaskTex is RFloat format, so only R channel has data
+    float4 maskSample = _MaskTex.SampleLevel(sampler_linear_clamp, uv, 0);
+    float alpha = maskSample.r; // Alpha stored in R channel (RFloat texture)
+    
+    // Apply edge refinement on RAW mask BEFORE threshold/feather
+    float finalAlpha = alpha;
+    if (_EdgeStrength > 0.001)
+    {
+        float edgeFactor = getMaskEdgeFactor(uv);
+        finalAlpha = refineMaskEdge(alpha, edgeFactor, _EdgeStrength);
+    }
+    
+    // Only apply threshold/feather if edge refinement is OFF (for backward compatibility)
+    // When edge refinement is ON, use soft alpha directly like RVMHybrid did
+    if (_EdgeStrength <= 0.001)
+    {
+        // Apply threshold with feather for smooth edges
+        float lower = max(0.0, _AlphaThreshold - _Feather);
+        float upper = min(1.0, _AlphaThreshold + _Feather);
+        float featherRange = upper - lower;
+        
+        if (featherRange > 0.001)
+        {
+            if (alpha <= lower)
+                finalAlpha = 0.0;
+            else if (alpha >= upper)
+                finalAlpha = 1.0;
+            else
+                finalAlpha = (alpha - lower) / featherRange;
+        }
+        else
+        {
+            finalAlpha = alpha >= _AlphaThreshold ? 1.0 : 0.0;
+        }
+    }
+    
+    // Get background color
+    float4 bgColor;
+    if (_UseBackgroundTex > 0)
+    {
+        bgColor = _BackgroundTex.SampleLevel(sampler_linear_clamp, uv, 0);
+    }
+    else
+    {
+        bgColor = _BackgroundColor;
+    }
+    
+    // Alpha blending: result = foreground * alpha + background * (1 - alpha)
+    float3 blended = src.rgb * finalAlpha + bgColor.rgb * (1.0 - finalAlpha);
+    
+    _Result[pix] = float4(blended, finalAlpha);
+}
+
+// ============== MORPHOLOGY KERNELS ==============
+Texture2D<float> _MorphInput;
+RWTexture2D<float> _MorphOutput;
+int2 _MorphSize;
+int _Radius;
+
+[numthreads(8,8,1)]
+void Erode(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_MorphSize.x || id.y >= (uint)_MorphSize.y) return;
+    
+    float minVal = 1.0;
+    int r2 = _Radius * _Radius;
+    
+    // Max radius is 10, so max iterations = 21 (-10 to +10)
+    [unroll(21)]
+    for (int ky = -_Radius; ky <= _Radius; ky++)
+    {
+        [unroll(21)]
+        for (int kx = -_Radius; kx <= _Radius; kx++)
+        {
+            if (kx * kx + ky * ky > r2) continue;
+            
+            int2 pos = clamp(int2(id.x + kx, id.y + ky), int2(0, 0), _MorphSize - int2(1, 1));
+            float val = _MorphInput.Load(int3(pos, 0));
+            minVal = min(minVal, val);
+        }
+    }
+    
+    _MorphOutput[id.xy] = minVal;
+}
+
+[numthreads(8,8,1)]
+void Dilate(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_MorphSize.x || id.y >= (uint)_MorphSize.y) return;
+    
+    float maxVal = 0.0;
+    int r2 = _Radius * _Radius;
+    
+    // Max radius is 10, so max iterations = 21 (-10 to +10)
+    [unroll(21)]
+    for (int ky = -_Radius; ky <= _Radius; ky++)
+    {
+        [unroll(21)]
+        for (int kx = -_Radius; kx <= _Radius; kx++)
+        {
+            if (kx * kx + ky * ky > r2) continue;
+            
+            int2 pos = clamp(int2(id.x + kx, id.y + ky), int2(0, 0), _MorphSize - int2(1, 1));
+            float val = _MorphInput.Load(int3(pos, 0));
+            maxVal = max(maxVal, val);
+        }
+    }
+    
+    _MorphOutput[id.xy] = maxVal;
+}
