@@ -13,13 +13,6 @@
 				{ "key": "Content-Encoding", "value": "br" },
 				{ "key": "Content-Type", "value": "application/wasm" }
 			]
-		},
-		{
-			"source": "/Build/(.*).data.br",
-			"headers": [
-				{ "key": "Content-Encoding", "value": "br" },
-				{ "key": "Content-Type", "value": "application/octet-stream" }
-			]
 		}
 	]
 }
